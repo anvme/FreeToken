@@ -338,3 +338,7 @@ def main() -> int:
         print(f'  ids  {out}')
         print(f'  text {text!r}')
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
