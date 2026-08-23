@@ -236,3 +236,25 @@ def test_decode_matches_reference():
         f"({errs['[K,V] as-is']:.3e} / {errs['[V,K] transposed']:.3e}): not a layout "
         "convention difference, the decode recurrence itself is wrong"
     )
+
+
+def test_value_head_perm_pairs_each_value_head_with_its_key_head():
+    """The GGUF stores value heads group-major; the fla kernels read them head-major.
+
+    ``value_head_perm`` is the gather that bridges the two: ``kernel[i] = ckpt[perm[i]]``.
+    The kernels pair kernel slot ``i`` with key head ``i // rep``, so the checkpoint head
+    landing in slot ``i`` must be one that belongs to key head ``i // rep`` -- which in
+    group-major order means ``perm[i] % num_k_heads == i // rep``.
+    """
+    from freetoken.models.qwen3_5_moe.gguf import value_head_perm
+
+    perm = value_head_perm(NUM_V_HEADS, NUM_K_HEADS)
+    rep = NUM_V_HEADS // NUM_K_HEADS
+    assert sorted(perm.tolist()) == list(range(NUM_V_HEADS)), "not a permutation"
+    for i in range(NUM_V_HEADS):
+        assert int(perm[i]) % NUM_K_HEADS == i // rep, (
+            f"kernel slot {i} reads key head {i // rep} but holds checkpoint value head "
+            f"{int(perm[i])}, which belongs to key head {int(perm[i]) % NUM_K_HEADS}"
+        )
+    # rep == 1 must be identity, so a non-GQA config is untouched.
+    assert value_head_perm(NUM_K_HEADS, NUM_K_HEADS).tolist() == list(range(NUM_K_HEADS))

@@ -278,6 +278,58 @@ def _dense_of(t, dtype) -> torch.Tensor:
     return flat.reshape(t.shape)
 
 
+def value_head_perm(num_v_heads: int, num_k_heads: int) -> torch.Tensor:
+    """Checkpoint value-head order -> the order the GDN kernels expect.
+
+    The GDN runs ``num_k_heads`` key heads against ``num_v_heads`` value heads, so each
+    key head serves ``rep = num_v_heads // num_k_heads`` value heads -- and there are two
+    incompatible ways to lay that out. The fla kernels (and HF's fused ``in_proj_qkvz``,
+    which interleaves q/k/v per key head) put value head ``j`` with key head ``j // rep``.
+    This GGUF, whose ``in_proj_qkv`` is already de-interleaved into ``[q | k | v]``, is
+    group-major instead: value head ``j`` belongs to key head ``j % num_k_heads``, i.e.
+    all of each key head's first value head, then all of its second.
+
+    Nothing in the tensor shapes distinguishes the two, and the difference preserves
+    every magnitude, so it survives shape checks, RMS probes and per-layer numeric diffs
+    untouched -- it simply makes the delta rule attend to the wrong history in all 30 GDN
+    layers. It shows up only in the text: greedily continuing the chat prompt gives
+    "AA water A:\\n   32." as-is versus "The user just said "hi". This is a simple
+    greeting" once permuted.
+
+    Returned as a gather index: ``kernel[i] = checkpoint[perm[i]]``.
+    """
+    rep = num_v_heads // num_k_heads
+    return torch.arange(num_v_heads).reshape(rep, num_k_heads).t().reshape(-1).contiguous()
+
+
+def _perm_head_rows(packed: torch.Tensor, perm: torch.Tensor, offset: int, rows_per_head: int):
+    """Reorder ``perm`` blocks of ``rows_per_head`` rows starting at ``offset``.
+
+    Block-quantized rows are self-contained (each carries its own scale), so permuting
+    whole rows needs no dequantization.
+    """
+    n = perm.numel() * rows_per_head
+    out = packed.clone()
+    seg = packed[offset:offset + n].reshape(perm.numel(), rows_per_head, -1)
+    out[offset:offset + n] = seg.index_select(0, perm).reshape(n, -1)
+    return out
+
+
+def _perm_head_cols(packed: torch.Tensor, perm: torch.Tensor, bytes_per_head: int):
+    """Reorder value-head column groups of a packed ``[out, row_bytes]`` weight.
+
+    Used for ``ssm_out``, whose *input* dim is the value dim. A value head spans whole
+    quant blocks (head_v_dim is a multiple of the block size), so this stays a byte
+    permutation rather than a dequantize/requantize round trip.
+    """
+    rows, row_bytes = packed.shape
+    assert row_bytes == perm.numel() * bytes_per_head, (
+        f"ssm_out row is {row_bytes} B, not {perm.numel()} heads x {bytes_per_head} B"
+    )
+    view = packed.reshape(rows, perm.numel(), bytes_per_head)
+    return view.index_select(1, perm).reshape(rows, row_bytes).contiguous()
+
+
 def iter_gguf_weights(
     model_path: str,
     device,
@@ -311,7 +363,11 @@ def iter_gguf_weights(
     L = config.num_layers
     I_sh = config.shared_expert_intermediate_size
     g = config.linear_attention_group()
-    conv_dim = 2 * g.num_key_heads * g.key_head_dim + g.num_value_heads * g.value_head_dim
+    key_dim = g.num_key_heads * g.key_head_dim
+    value_dim = g.num_value_heads * g.value_head_dim
+    conv_dim = 2 * key_dim + value_dim
+    # Applied to every per-value-head tensor below; see value_head_perm.
+    vperm = value_head_perm(g.num_value_heads, g.num_key_heads)
     assert I_sh > 0, "qwen35moe expects a shared expert"
 
     bf16, f32 = torch.bfloat16, torch.float32
@@ -381,7 +437,16 @@ def iter_gguf_weights(
         elif is_linear and suffix in (
             "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight"
         ):
-            in_proj_buf.setdefault(layer, {})[suffix] = (t, t.packed())
+            # Reorder every per-value-head row group into the kernels' head-major order
+            # (see value_head_perm). attn_qkv's q|k rows are untouched; only its v tail is.
+            pk = t.packed()
+            if suffix == "attn_qkv.weight":
+                pk = _perm_head_rows(pk, vperm, 2 * key_dim, g.value_head_dim)
+            elif suffix == "attn_gate.weight":
+                pk = _perm_head_rows(pk, vperm, 0, g.value_head_dim)
+            else:  # ssm_beta / ssm_alpha: exactly one row per value head
+                pk = _perm_head_rows(pk, vperm, 0, 1)
+            in_proj_buf.setdefault(layer, {})[suffix] = (t, pk)
             if len(in_proj_buf[layer]) == 4:
                 yield from emit_fused(
                     in_proj_buf, layer,
@@ -392,19 +457,32 @@ def iter_gguf_weights(
                     ("attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight"),
                 )
         elif is_linear and suffix == "ssm_out.weight":
+            # out_proj consumes the value dim, so its input columns follow the same
+            # value-head reordering as everything that produces them.
             if T["gdn_out"] is not None:
                 assert t.ggml_type == T["gdn_out"]
-                yield f"{base}.linear_attn.out_proj.qweight", t.packed()
+                yield f"{base}.linear_attn.out_proj.qweight", _perm_head_cols(
+                    t.packed(), vperm, row_bytes(g.value_head_dim, T["gdn_out"])
+                )
             else:
-                yield f"{base}.linear_attn.out_proj.weight", _dense_of(t, bf16)
+                dense = _dense_of(t, bf16).reshape(config.hidden_size, g.num_value_heads, -1)
+                yield f"{base}.linear_attn.out_proj.weight", (
+                    dense.index_select(1, vperm).reshape(config.hidden_size, -1)
+                )
         elif is_linear and suffix == "ssm_conv1d.weight":
-            yield f"{base}.linear_attn.conv1d.weight", _dense_of(t, f32).reshape(conv_dim, 1, -1)
+            # The conv is depthwise over [q | k | v]; reorder the v channels only.
+            conv = _dense_of(t, f32)
+            v = conv[2 * key_dim:].reshape(g.num_value_heads, g.value_head_dim, -1)
+            conv = torch.cat(
+                [conv[: 2 * key_dim], v.index_select(0, vperm).reshape(value_dim, -1)], dim=0
+            )
+            yield f"{base}.linear_attn.conv1d.weight", conv.reshape(conv_dim, 1, -1)
         elif is_linear and suffix == "ssm_a":
-            a = _dense_of(t, f32)
+            a = _dense_of(t, f32).index_select(0, vperm)  # one entry per value head
             assert (a < 0).all(), "ssm_a must be negative (stores -exp(A_log))"
             yield f"{base}.linear_attn.A_log", torch.log(-a)
         elif is_linear and suffix == "ssm_dt.bias":
-            yield f"{base}.linear_attn.dt_bias", _dense_of(t, f32)
+            yield f"{base}.linear_attn.dt_bias", _dense_of(t, f32).index_select(0, vperm)
         elif is_linear and suffix == "ssm_norm.weight":
             yield f"{base}.linear_attn.norm.weight", _dense_of(t, bf16)
         # ---- full attention only ----
