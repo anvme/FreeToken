@@ -115,6 +115,7 @@ class Qwen3_5Model(BaseOP):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        global _probe_forwards
         x = self.embed_tokens.forward(input_ids)
         if _probing():
             print(
@@ -128,7 +129,6 @@ class Qwen3_5Model(BaseOP):
         probe = _probing()
         x, _ = self.norm.forward_add_residual(x, residual)
         if probe:
-            global _probe_forwards
             print(f"[probe] final_norm_rms={_rms(x):.4f}", flush=True)
             _probe_forwards += 1
         return x

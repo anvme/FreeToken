@@ -10,10 +10,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from freetoken.utils import init_logger
+
 from .reader import gguf_architecture, load_gguf_metadata
+
+logger = init_logger(__name__)
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 _TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+
+# tokenizer.ggml.token_type values (llama.cpp llama_token_attr).
+_GGML_TOKEN_CONTROL = 3
+_GGML_TOKEN_USER_DEFINED = 4
 
 # Arch names newer than the installed transformers (whose GGUF_TO_FAST_CONVERTERS
 # predates them) -> converter keys whose construction is compatible (GPT2 vocab +
@@ -38,6 +46,55 @@ def _converter_key(arch: str) -> str:
     )
 
 
+def _register_ggml_added_tokens(fast, tok_dict: dict[str, Any]) -> tuple[int, int]:
+    """Teach the fast tokenizer about every marker token the GGUF declares.
+
+    transformers' Qwen GGUF converters hardcode a three-token special list
+    (``<|endoftext|>``, ``<|im_start|>``, ``<|im_end|>``). Every *other* marker the
+    chat template emits is therefore unknown to the tokenizer and gets BPE-split into
+    ordinary pieces -- on Ornith, ``<think>`` became ``[13314, 741, 29]`` instead of
+    ``[248068]``, so the assistant turn began with three tokens the model has never
+    seen in that position (its training data always starts the turn with ``<think>``).
+
+    The GGUF already carries the right classification per token, so use it instead of
+    a hardcoded list:
+
+    * ``CONTROL`` -> special, i.e. stripped by ``skip_special_tokens`` (``<|im_start|>``,
+      the vision/audio markers).
+    * ``USER_DEFINED`` -> added but *not* special, matching Qwen's own
+      ``tokenizer_config.json``: ``</think>`` and ``</tool_call>`` must survive
+      detokenization or the reasoning / tool-call parsers never see them.
+
+    Returns ``(n_control, n_user_defined)``. Every one of these strings is already in
+    ``tokenizer.ggml.tokens``, so registering them maps to existing ids rather than
+    minting new ones -- asserted here, since a grown vocab would silently shift the
+    embedding table out of alignment with the checkpoint.
+    """
+    from tokenizers import AddedToken
+
+    tokens = tok_dict["tokens"]
+    types = tok_dict.get("token_type") or []
+    by_attr: dict[int, list[str]] = {_GGML_TOKEN_CONTROL: [], _GGML_TOKEN_USER_DEFINED: []}
+    for tok, attr in zip(tokens, types):
+        bucket = by_attr.get(int(attr))
+        if bucket is not None:
+            bucket.append(tok)
+
+    before = fast.get_vocab_size(with_added_tokens=True)
+    control = by_attr[_GGML_TOKEN_CONTROL]
+    user = by_attr[_GGML_TOKEN_USER_DEFINED]
+    if control:
+        fast.add_special_tokens([AddedToken(t, normalized=False, special=True) for t in control])
+    if user:
+        fast.add_tokens([AddedToken(t, normalized=False, special=False) for t in user])
+    after = fast.get_vocab_size(with_added_tokens=True)
+    assert after == before, (
+        f"registering the GGUF's control/user-defined tokens grew the vocab "
+        f"{before} -> {after}: some are absent from tokenizer.ggml.tokens"
+    )
+    return len(control), len(user)
+
+
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
     from transformers.integrations.ggml import convert_gguf_tokenizer
@@ -51,6 +108,11 @@ def load_gguf_tokenizer(model_path: str):
         if k.startswith("tokenizer.ggml.")
     }
     fast, _extra = convert_gguf_tokenizer(_converter_key(conv_arch), tok_dict)
+    n_control, n_user = _register_ggml_added_tokens(fast, tok_dict)
+    logger.info_rank0(
+        f"GGUF tokenizer: registered {n_control} control + {n_user} user-defined tokens "
+        "from tokenizer.ggml.token_type"
+    )
 
     tokens = tok_dict["tokens"]
 
