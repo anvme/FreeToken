@@ -45,6 +45,29 @@ def _rms(t: torch.Tensor) -> float:
     return float(t.detach().float().pow(2).mean().sqrt())
 
 
+# FREETOKEN_DUMP_LAYER=N saves that layer's inputs and every intermediate of the first
+# real prefill to FREETOKEN_DUMP_PATH, so scripts/diag_ornith_layer_ref.py can recompute
+# the same layer from the GGUF in fp32 and diff sublayer by sublayer. RMS alone cannot
+# catch a bug that computes the wrong thing at the right magnitude; an actual reference
+# can.
+_DUMP_LAYER = int(os.environ.get("FREETOKEN_DUMP_LAYER", "-1"))
+_DUMP_PATH = os.environ.get("FREETOKEN_DUMP_PATH", "ornith_layer_dump.pt")
+_dump: dict[str, torch.Tensor] = {}
+_dump_done = False
+
+
+def _dumping() -> bool:
+    return (
+        _DUMP_LAYER >= 0
+        and not _dump_done
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _keep(name: str, t: torch.Tensor) -> None:
+    _dump[name] = t.detach().float().cpu().clone()
+
+
 class Qwen3_5DecoderLayer(BaseOP):
     """Pre-norm hybrid block: ``x = x + mixer(input_norm(x)); x = x + moe(post_norm(x))``,
     where the mixer is a GatedDeltaNet (linear layers) or gated attention (full layers).
@@ -86,12 +109,23 @@ class Qwen3_5DecoderLayer(BaseOP):
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
         probe = _probing()
+        # "embed" is only recorded on a real prefill, so it also gates out the warmup pass.
+        dump = _dumping() and self._layer_id == _DUMP_LAYER and "embed" in _dump
         norm_in = _rms(hidden) if probe else 0.0
+        if dump:
+            _keep("norm_in", hidden)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
         mixer_out = _rms(hidden) if probe else 0.0
+        if dump:
+            _keep("mixer_out", hidden)
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
         mlp_in = _rms(hidden) if probe else 0.0
+        if dump:
+            _keep("mlp_in", hidden)
+            _keep("residual_mid", residual)
         hidden = self.mlp.forward(hidden)
+        if dump:
+            _keep("mlp_out", hidden)
         if probe:
             print(
                 f"[probe] layer {self._layer_id:>2} {'gdn ' if self._is_linear else 'attn'}"
@@ -115,8 +149,14 @@ class Qwen3_5Model(BaseOP):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        global _probe_forwards
+        global _probe_forwards, _dump_done
         x = self.embed_tokens.forward(input_ids)
+        # Only a real prefill is worth dumping: the bs=1 warmup carries a dummy token.
+        dump = _dumping() and input_ids.shape[0] > 1
+        if dump:
+            _keep("input_ids", input_ids)
+            _keep("embed", x)
+            _keep("positions", get_global_ctx().batch.positions)
         if _probing():
             print(
                 f"[probe] forward #{_probe_forwards} tokens={input_ids.shape[0]} "
@@ -131,6 +171,15 @@ class Qwen3_5Model(BaseOP):
         if probe:
             print(f"[probe] final_norm_rms={_rms(x):.4f}", flush=True)
             _probe_forwards += 1
+        if dump and "mlp_out" in _dump:
+            _keep("final_norm", x)
+            torch.save(_dump, _DUMP_PATH)
+            _dump_done = True
+            print(
+                f"[dump] layer {_DUMP_LAYER} tensors -> {_DUMP_PATH} "
+                f"({', '.join(sorted(_dump))})",
+                flush=True,
+            )
         return x
 
 
