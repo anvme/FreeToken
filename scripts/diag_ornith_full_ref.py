@@ -86,28 +86,36 @@ def main() -> int:
 
     T_ = {t.name: t for t in iter_gguf_tensors(args.gguf)}
 
-    def deq(t, shape=None):
-        out = dequantize(torch.from_numpy(t._raw).reshape(-1), t.ggml_type, torch.float32)
-        return out.reshape(shape if shape is not None else t.shape)
+    def deq_raw(raw: np.ndarray, ggml_type: int, shape) -> torch.Tensor:
+        """Dequantize packed ggml bytes to a dense fp32 tensor of ``shape``."""
+        flat = dequantize(torch.from_numpy(np.ascontiguousarray(raw)).reshape(-1),
+                          ggml_type, torch.float32)
+        return flat.reshape(shape)
+
+    def deq(t) -> torch.Tensor:
+        return deq_raw(t._raw, t.ggml_type, t.shape)
+
+    def deq_rows(t, lo: int, hi: int, shape) -> torch.Tensor:
+        """Dequantize a row slice -- one expert, or a block of the LM head."""
+        return deq_raw(t._raw[lo:hi], t.ggml_type, shape)
 
     def W(layer, suffix):
         return deq(T_[f"blk.{layer}.{suffix}"])
 
     tok = load_gguf_tokenizer(args.gguf)
-    ids = torch.tensor(
-        tok.apply_chat_template(
-            [{"role": "user", "content": args.prompt}],
-            tokenize=True, add_generation_prompt=True,
-        )
-    ).long()
+    text = tok.apply_chat_template(
+        [{"role": "user", "content": args.prompt}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    # Go through the backend tokenizers.Tokenizer: the transformers wrapper's return type
+    # varies by version (this one hands back a tokenizers.Encoding), while the backend
+    # always yields .ids and still applies the added-token vocabulary.
+    ids = torch.tensor(tok.backend_tokenizer.encode(text, add_special_tokens=False).ids).long()
     Tn = ids.numel()
     print(f"prompt -> {Tn} tokens: {ids.tolist()}")
 
     emb = T_["token_embd.weight"]
-    x = deq(
-        type("t", (), {"_raw": np.ascontiguousarray(emb._raw[ids.numpy()]),
-                       "ggml_type": emb.ggml_type, "shape": (Tn, H)})()
-    )
+    x = deq_raw(emb._raw[ids.numpy()], emb.ggml_type, (Tn, H))
     pos = torch.arange(Tn).float()
 
     # rope tables -------------------------------------------------------------
@@ -205,15 +213,10 @@ def main() -> int:
         if "moe-gate-up" in flips:
             ge, ue = ue, ge
 
-        def slab(t, e, rows, shape):
-            return deq(type("t", (), {
-                "_raw": np.ascontiguousarray(t._raw[e * rows:(e + 1) * rows]),
-                "ggml_type": t.ggml_type, "shape": shape}()))
-
         used = sorted(set(tid.reshape(-1).tolist()))
-        gw = {e: slab(ge, e, I, (I, H)) for e in used}
-        uw = {e: slab(ue, e, I, (I, H)) for e in used}
-        dw = {e: slab(de, e, H, (H, I)) for e in used}
+        gw = {e: deq_rows(ge, e * I, (e + 1) * I, (I, H)) for e in used}
+        uw = {e: deq_rows(ue, e * I, (e + 1) * I, (I, H)) for e in used}
+        dw = {e: deq_rows(de, e * H, (e + 1) * H, (H, I)) for e in used}
         routed = torch.zeros(Tn, H)
         for i in range(Tn):
             for j in range(cfg.num_experts_per_tok):
@@ -233,9 +236,7 @@ def main() -> int:
     logits = torch.empty(V)
     for s in range(0, V, blk):
         e = min(s + blk, V)
-        wb = deq(type("t", (), {"_raw": np.ascontiguousarray(head._raw[s:e]),
-                                "ggml_type": head.ggml_type, "shape": (e - s, H)})())
-        logits[s:e] = wb @ xl
+        logits[s:e] = deq_rows(head, s, e, (e - s, H)) @ xl
     p = logits.softmax(-1)
     toks = load_gguf_metadata(args.gguf)["tokenizer.ggml.tokens"]
     top = p.topk(args.topk)
