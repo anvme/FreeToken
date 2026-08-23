@@ -50,7 +50,9 @@ FLIPS = ("gdn-qk", "moe-gate-up", "attn-gate", "gdn-ba", "rope-gptj", "rope-full
 
 
 def rms_norm(x, w, eps):
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+    # Norms accumulate in fp32 and return in the working dtype, as the fused kernels do.
+    out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps) * w.float()
+    return out.to(x.dtype)
 
 
 def _r(t: torch.Tensor) -> float:
@@ -65,6 +67,9 @@ def main() -> int:
     ap.add_argument("--topk", type=int, default=15)
     ap.add_argument("--engine-dump", default=None,
                     help="a FREETOKEN_DUMP_LAYER=all .pt; adds per-layer cosine vs the engine")
+    ap.add_argument("--dtype", choices=("fp32", "bf16"), default="fp32",
+                    help="working precision. bf16 matches what the engine stores between "
+                         "layers, which tests whether the drift is precision rather than a bug")
     args = ap.parse_args()
 
     flips = {f.strip() for f in args.flip.split(",") if f.strip()}
@@ -88,7 +93,7 @@ def main() -> int:
     key_dim, val_dim = n_k * dk, n_v * dv
     n_q, n_kv, hd = cfg.num_qo_heads, cfg.num_kv_heads, cfg.head_dim
     rot = cfg.rotary_config
-    print(f"flips: {sorted(flips) or ['(none - baseline)']}")
+    print(f"flips: {sorted(flips) or ['(none - baseline)']}  dtype: {args.dtype}")
 
     T_ = {t.name: t for t in iter_gguf_tensors(args.gguf)}
 
@@ -98,8 +103,10 @@ def main() -> int:
                           ggml_type, torch.float32)
         return flat.reshape(shape)
 
+    dt = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+
     def deq(t) -> torch.Tensor:
-        return deq_raw(t._raw, t.ggml_type, t.shape)
+        return deq_raw(t._raw, t.ggml_type, t.shape).to(dt)
 
     def deq_rows(t, lo: int, hi: int, shape) -> torch.Tensor:
         """Dequantize a row slice -- one expert, or a block of the LM head."""
@@ -121,7 +128,7 @@ def main() -> int:
     print(f"prompt -> {Tn} tokens: {ids.tolist()}")
 
     emb = T_["token_embd.weight"]
-    x = deq_raw(emb._raw[ids.numpy()], emb.ggml_type, (Tn, H))
+    x = deq_raw(emb._raw[ids.numpy()], emb.ggml_type, (Tn, H)).to(dt)
     pos = torch.arange(Tn).float()
 
     # rope tables -------------------------------------------------------------
@@ -136,7 +143,7 @@ def main() -> int:
     cos_t, sin_t = ang.cos(), ang.sin()
 
     def rope(t):  # [T, heads, hd]
-        r, keep = t[..., :rd], t[..., rd:]
+        r, keep = t[..., :rd].float(), t[..., rd:].float()
         c, s = cos_t[:, None, :], sin_t[:, None, :]
         if "rope-gptj" in flips:
             a, b = r[..., 0::2], r[..., 1::2]
@@ -144,7 +151,7 @@ def main() -> int:
         else:
             a, b = r[..., : rd // 2], r[..., rd // 2 :]
             out = torch.cat([a * c - b * s, b * c + a * s], dim=-1)
-        return torch.cat([out, keep], dim=-1)
+        return torch.cat([out, keep], dim=-1).to(t.dtype)
 
     # Optional engine trace to compare against. Cosine is the point: the RMS traces agree
     # to ~5% through layer 23 and then break, but equal magnitude does not mean equal
@@ -233,10 +240,10 @@ def main() -> int:
             ge, ue = ue, ge
 
         used = sorted(set(tid.reshape(-1).tolist()))
-        gw = {e: deq_rows(ge, e * I, (e + 1) * I, (I, H)) for e in used}
-        uw = {e: deq_rows(ue, e * I, (e + 1) * I, (I, H)) for e in used}
-        dw = {e: deq_rows(de, e * H, (e + 1) * H, (H, I)) for e in used}
-        routed = torch.zeros(Tn, H)
+        gw = {e: deq_rows(ge, e * I, (e + 1) * I, (I, H)).to(dt) for e in used}
+        uw = {e: deq_rows(ue, e * I, (e + 1) * I, (I, H)).to(dt) for e in used}
+        dw = {e: deq_rows(de, e * H, (e + 1) * H, (H, I)).to(dt) for e in used}
+        routed = torch.zeros(Tn, H, dtype=dt)
         for i in range(Tn):
             for j in range(cfg.num_experts_per_tok):
                 e = int(tid[i, j])
@@ -273,7 +280,7 @@ def main() -> int:
     logits = torch.empty(V)
     for s in range(0, V, blk):
         e = min(s + blk, V)
-        logits[s:e] = deq_rows(head, s, e, (e - s, H)) @ xl
+        logits[s:e] = deq_rows(head, s, e, (e - s, H)) @ xl.float()
     p = logits.softmax(-1)
     toks = load_gguf_metadata(args.gguf)["tokenizer.ggml.tokens"]
     top = p.topk(args.topk)
