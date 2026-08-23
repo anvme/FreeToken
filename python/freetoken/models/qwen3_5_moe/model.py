@@ -101,6 +101,19 @@ class Qwen3_5DecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
+        probe = _probing()
+        # "embed" is only recorded on a real prefill, so it also gates out the warmup pass.
+        dump = _dumping() and self._layer_id == _DUMP_LAYER and "embed" in _dump
+        if dump:
+            # Capture BEFORE the input norm: layer L>0 starts mid-residual-stream, and the
+            # reference reconstructs its input as hidden + residual -- the same sum
+            # forward_add_residual folds in. Recording after the norm would hand the
+            # reference a post-norm hidden and a post-add residual instead.
+            # forward_add_residual is in-place (sgl_kernel fused_add_rmsnorm), so these
+            # clones have to happen first.
+            _keep("entry_hidden", hidden)
+            if residual is not None:
+                _keep("entry_residual", residual)
         # Residual-stream form: fuse each residual-add into the next RMSNorm
         # (GemmaRMSNorm.forward_add_residual) so add + norm are one kernel per sublayer.
         if residual is None:
@@ -108,15 +121,6 @@ class Qwen3_5DecoderLayer(BaseOP):
             hidden = self.input_layernorm.forward(hidden)
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
-        probe = _probing()
-        # "embed" is only recorded on a real prefill, so it also gates out the warmup pass.
-        dump = _dumping() and self._layer_id == _DUMP_LAYER and "embed" in _dump
-        if dump:
-            # Layer L>0 starts from the residual stream, not the embedding, so the
-            # reference needs this layer's actual entry state to check it in isolation.
-            _keep("entry_hidden", hidden)
-            if residual is not None:
-                _keep("entry_residual", residual)
         norm_in = _rms(hidden) if probe else 0.0
         if dump:
             _keep("norm_in", hidden)
