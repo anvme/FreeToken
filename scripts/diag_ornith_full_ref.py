@@ -46,7 +46,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-FLIPS = ("gdn-qk", "moe-gate-up", "attn-gate", "gdn-ba", "rope-gptj", "rope-full")
+FLIPS = ("gdn-qk", "moe-gate-up", "attn-gate", "gdn-ba", "rope-gptj", "rope-full",
+         "gdn-conv-rev", "gdn-gqa-tile", "attn-gqa-tile")
 
 
 def rms_norm(x, w, eps):
@@ -184,6 +185,10 @@ def main() -> int:
                 b_raw, a_raw = a_raw, b_raw
 
             conv_w = W(L, "ssm_conv1d.weight").reshape(2 * key_dim + val_dim, 1, -1)
+            if "gdn-conv-rev" in flips:
+                # ggml_ssm_conv and torch's conv1d disagree on tap order for some
+                # conversions; a reversed kernel is causal either way and same-magnitude.
+                conv_w = conv_w.flip(-1)
             cd = conv_w.shape[0]
             mixed = F.conv1d(
                 qkv.T.unsqueeze(0), conv_w, groups=cd, padding=conv_w.shape[-1] - 1
@@ -192,8 +197,13 @@ def main() -> int:
             q, k, v = torch.split(mixed, [key_dim, key_dim, val_dim], dim=-1)
             if "gdn-qk" in flips:
                 q, k = k, q
-            q = q.reshape(1, Tn, n_k, dk).repeat_interleave(n_v // n_k, dim=2)
-            k = k.reshape(1, Tn, n_k, dk).repeat_interleave(n_v // n_k, dim=2)
+            rep_g = n_v // n_k
+            if "gdn-gqa-tile" in flips:
+                q = q.reshape(1, Tn, n_k, dk).repeat(1, 1, rep_g, 1)
+                k = k.reshape(1, Tn, n_k, dk).repeat(1, 1, rep_g, 1)
+            else:
+                q = q.reshape(1, Tn, n_k, dk).repeat_interleave(rep_g, dim=2)
+                k = k.reshape(1, Tn, n_k, dk).repeat_interleave(rep_g, dim=2)
             v = v.reshape(1, Tn, n_v, dv)
 
             # A_log / dt_bias are exempt from the model-dtype downcast in the engine and
@@ -223,7 +233,10 @@ def main() -> int:
             q = rope(rms_norm(q, W(L, "attn_q_norm.weight"), eps))
             k = rope(rms_norm(k, W(L, "attn_k_norm.weight"), eps))
             rep = n_q // n_kv
-            kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+            if "attn-gqa-tile" in flips:
+                kk, vv = k.repeat(1, rep, 1), v.repeat(1, rep, 1)
+            else:
+                kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
             # Scores and softmax accumulate in fp32 (as every attention kernel does), then
             # the result returns to the working dtype.
             sc = torch.einsum("qhd,khd->hqk", q.float(), kk.float()) / math.sqrt(hd)
