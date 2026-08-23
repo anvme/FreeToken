@@ -115,6 +115,11 @@ def main() -> int:
     def W(layer, suffix):
         return deq(T_[f"blk.{layer}.{suffix}"])
 
+    def Wf(layer, suffix):
+        """fp32 regardless of --dtype: the scalars the engine keeps out of the downcast."""
+        t = T_[f"blk.{layer}.{suffix}"]
+        return deq_raw(t._raw, t.ggml_type, t.shape)
+
     tok = load_gguf_tokenizer(args.gguf)
     text = tok.apply_chat_template(
         [{"role": "user", "content": args.prompt}],
@@ -191,17 +196,21 @@ def main() -> int:
             k = k.reshape(1, Tn, n_k, dk).repeat_interleave(n_v // n_k, dim=2)
             v = v.reshape(1, Tn, n_v, dv)
 
-            A_log = torch.log(-W(L, "ssm_a"))
-            dt_bias = W(L, "ssm_dt.bias")
-            beta = b_raw.sigmoid().reshape(1, Tn, n_v)
-            gg = (-A_log.exp() * F.softplus(a_raw + dt_bias)).reshape(1, Tn, n_v)
+            # A_log / dt_bias are exempt from the model-dtype downcast in the engine and
+            # the gating is evaluated in fp32; keep that here or bf16 noise enters the
+            # decay before the recurrence ever runs.
+            A_log = torch.log(-Wf(L, "ssm_a"))
+            dt_bias = Wf(L, "ssm_dt.bias")
+            beta = b_raw.float().sigmoid().reshape(1, Tn, n_v)
+            gg = (-A_log.exp() * F.softplus(a_raw.float() + dt_bias)).reshape(1, Tn, n_v)
             core, _ = recurrent_gated_delta_rule(q, k, v, gg, beta, use_qk_l2norm=True)
 
-            core = core[0].reshape(-1, dv)
-            zz = z.reshape(-1, dv)
-            nw = W(L, "ssm_norm.weight")
+            # Gated RMSNorm in fp32, like the fused rms_norm_gated kernel.
+            core = core[0].reshape(-1, dv).float()
+            zz = z.reshape(-1, dv).float()
+            nw = Wf(L, "ssm_norm.weight")
             core = core * torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + eps) * nw
-            core = core * F.silu(zz)
+            core = (core * F.silu(zz)).to(dt)
             mixer = core.reshape(Tn, -1) @ W(L, "ssm_out.weight").T
         else:
             qg = (h @ W(L, "attn_q.weight").T).view(Tn, n_q, hd * 2)
@@ -215,9 +224,12 @@ def main() -> int:
             k = rope(rms_norm(k, W(L, "attn_k_norm.weight"), eps))
             rep = n_q // n_kv
             kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
-            sc = torch.einsum("qhd,khd->hqk", q, kk) / math.sqrt(hd)
+            # Scores and softmax accumulate in fp32 (as every attention kernel does), then
+            # the result returns to the working dtype.
+            sc = torch.einsum("qhd,khd->hqk", q.float(), kk.float()) / math.sqrt(hd)
             sc = sc + torch.full((Tn, Tn), float("-inf")).triu(1)
-            o = torch.einsum("hqk,khd->qhd", sc.softmax(-1), vv).reshape(Tn, n_q * hd)
+            o = torch.einsum("hqk,khd->qhd", sc.softmax(-1), vv.float())
+            o = o.reshape(Tn, n_q * hd).to(dt)
             mixer = (o * torch.sigmoid(gate.reshape(Tn, n_q * hd))) @ W(L, "attn_output.weight").T
 
         residual = residual + mixer
@@ -231,9 +243,11 @@ def main() -> int:
         shared = (F.silu(h2 @ gs.T) * (h2 @ us.T)) @ ds.T
         shared = shared * torch.sigmoid(h2 @ W(L, "ffn_gate_inp_shexp.weight").reshape(1, H).T)
 
-        probs = (h2 @ W(L, "ffn_gate_inp.weight").T).softmax(-1)
+        # Match fused_topk: logits from the working-dtype linear, softmax in fp32. The
+        # router is the discrete amplifier in this model, so its precision is not a detail.
+        probs = (h2 @ W(L, "ffn_gate_inp.weight").T).float().softmax(-1)
         tw, tid = probs.topk(cfg.num_experts_per_tok, dim=-1)
-        tw = tw / tw.sum(-1, keepdim=True)
+        tw = (tw / tw.sum(-1, keepdim=True)).to(dt)
         E, I = cfg.num_experts, cfg.moe_intermediate_size
         ge, ue, de = (T_[f"blk.{L}.ffn_{n}_exps.weight"] for n in ("gate", "up", "down"))
         if "moe-gate-up" in flips:
