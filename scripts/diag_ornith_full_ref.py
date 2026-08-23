@@ -66,6 +66,9 @@ def main() -> int:
     ap.add_argument("--flip", default="", help=f"comma-separated: {', '.join(FLIPS)}")
     ap.add_argument("--prompt", default="hi")
     ap.add_argument("--topk", type=int, default=15)
+    ap.add_argument("--generate", type=int, default=0,
+                    help="greedily continue N tokens; a real test of coherence, "
+                         "unlike top-k at one high-entropy position")
     ap.add_argument("--engine-dump", default=None,
                     help="a FREETOKEN_DUMP_LAYER=all .pt; adds per-layer cosine vs the engine")
     ap.add_argument("--dtype", choices=("fp32", "bf16"), default="fp32",
@@ -134,8 +137,6 @@ def main() -> int:
     print(f"prompt -> {Tn} tokens: {ids.tolist()}")
 
     emb = T_["token_embd.weight"]
-    x = deq_raw(emb._raw[ids.numpy()], emb.ggml_type, (Tn, H)).to(dt)
-    pos = torch.arange(Tn).float()
 
     # rope tables -------------------------------------------------------------
     rd = rot.rotary_dim
@@ -145,19 +146,6 @@ def main() -> int:
         inv = 1.0 / (rot.base ** (torch.arange(0, hd, 2).float() / hd))[: rd // 2]
     else:
         inv = 1.0 / (rot.base ** (torch.arange(0, rd, 2).float() / rd))
-    ang = pos[:, None] * inv[None, :]
-    cos_t, sin_t = ang.cos(), ang.sin()
-
-    def rope(t):  # [T, heads, hd]
-        r, keep = t[..., :rd].float(), t[..., rd:].float()
-        c, s = cos_t[:, None, :], sin_t[:, None, :]
-        if "rope-gptj" in flips:
-            a, b = r[..., 0::2], r[..., 1::2]
-            out = torch.stack([a * c - b * s, b * c + a * s], dim=-1).flatten(-2)
-        else:
-            a, b = r[..., : rd // 2], r[..., rd // 2 :]
-            out = torch.cat([a * c - b * s, b * c + a * s], dim=-1)
-        return torch.cat([out, keep], dim=-1).to(t.dtype)
 
     # Optional engine trace to compare against. Cosine is the point: the RMS traces agree
     # to ~5% through layer 23 and then break, but equal magnitude does not mean equal
@@ -171,151 +159,182 @@ def main() -> int:
         )
         print(f"comparing against engine dump {args.engine_dump}")
 
-    t0 = time.time()
-    residual = x
-    for L in range(cfg.num_layers):
-        h = rms_norm(residual, W(L, "attn_norm.weight"), eps)
+    def forward_logits(ids_now, trace: bool):
+        """Full forward over ids_now; returns logits for the last position."""
+        Tn = ids_now.numel()
+        x = deq_raw(emb._raw[ids_now.numpy()], emb.ggml_type, (Tn, H)).to(dt)
+        pos = torch.arange(Tn).float()
+        ang = pos[:, None] * inv[None, :]
+        cos_t, sin_t = ang.cos(), ang.sin()
 
-        if cfg.is_linear_layer(L):
-            qkv = h @ W(L, "attn_qkv.weight").T
-            z = h @ W(L, "attn_gate.weight").T
-            b_raw = h @ W(L, "ssm_beta.weight").T
-            a_raw = h @ W(L, "ssm_alpha.weight").T
-            if "gdn-ba" in flips:
-                b_raw, a_raw = a_raw, b_raw
-
-            conv_w = W(L, "ssm_conv1d.weight").reshape(2 * key_dim + val_dim, 1, -1)
-            if "gdn-conv-rev" in flips:
-                # ggml_ssm_conv and torch's conv1d disagree on tap order for some
-                # conversions; a reversed kernel is causal either way and same-magnitude.
-                conv_w = conv_w.flip(-1)
-            cd = conv_w.shape[0]
-            mixed = F.conv1d(
-                qkv.T.unsqueeze(0), conv_w, groups=cd, padding=conv_w.shape[-1] - 1
-            )[0, :, :Tn].T
-            mixed = F.silu(mixed)
-            q, k, v = torch.split(mixed, [key_dim, key_dim, val_dim], dim=-1)
-            if "gdn-qk" in flips:
-                q, k = k, q
-            rep_g = n_v // n_k
-            if "gdn-gqa-tile" in flips:
-                q = q.reshape(1, Tn, n_k, dk).repeat(1, 1, rep_g, 1)
-                k = k.reshape(1, Tn, n_k, dk).repeat(1, 1, rep_g, 1)
+        def rope(t):  # [T, heads, hd]
+            r, keep = t[..., :rd].float(), t[..., rd:].float()
+            c, s = cos_t[:, None, :], sin_t[:, None, :]
+            if "rope-gptj" in flips:
+                a, b = r[..., 0::2], r[..., 1::2]
+                out = torch.stack([a * c - b * s, b * c + a * s], dim=-1).flatten(-2)
             else:
-                q = q.reshape(1, Tn, n_k, dk).repeat_interleave(rep_g, dim=2)
-                k = k.reshape(1, Tn, n_k, dk).repeat_interleave(rep_g, dim=2)
-            v = v.reshape(1, Tn, n_v, dv)
+                a, b = r[..., : rd // 2], r[..., rd // 2 :]
+                out = torch.cat([a * c - b * s, b * c + a * s], dim=-1)
+            return torch.cat([out, keep], dim=-1).to(t.dtype)
+        residual = x
+        for L in range(cfg.num_layers):
+            h = rms_norm(residual, W(L, "attn_norm.weight"), eps)
 
-            # A_log / dt_bias are exempt from the model-dtype downcast in the engine and
-            # the gating is evaluated in fp32; keep that here or bf16 noise enters the
-            # decay before the recurrence ever runs.
-            A_log = torch.log(-Wf(L, "ssm_a"))
-            dt_bias = Wf(L, "ssm_dt.bias")
-            beta = b_raw.float().sigmoid().reshape(1, Tn, n_v)
-            gg = (-A_log.exp() * F.softplus(a_raw.float() + dt_bias)).reshape(1, Tn, n_v)
-            core, _ = recurrent_gated_delta_rule(q, k, v, gg, beta, use_qk_l2norm=True)
+            if cfg.is_linear_layer(L):
+                qkv = h @ W(L, "attn_qkv.weight").T
+                z = h @ W(L, "attn_gate.weight").T
+                b_raw = h @ W(L, "ssm_beta.weight").T
+                a_raw = h @ W(L, "ssm_alpha.weight").T
+                if "gdn-ba" in flips:
+                    b_raw, a_raw = a_raw, b_raw
 
-            # Gated RMSNorm in fp32, like the fused rms_norm_gated kernel.
-            core = core[0].reshape(-1, dv).float()
-            zz = z.reshape(-1, dv).float()
-            nw = Wf(L, "ssm_norm.weight")
-            core = core * torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + eps) * nw
-            core = (core * F.silu(zz)).to(dt)
-            mixer = core.reshape(Tn, -1) @ W(L, "ssm_out.weight").T
-        else:
-            qg = (h @ W(L, "attn_q.weight").T).view(Tn, n_q, hd * 2)
-            if "attn-gate" in flips:
-                gate, q = qg[..., :hd], qg[..., hd:]
+                conv_w = W(L, "ssm_conv1d.weight").reshape(2 * key_dim + val_dim, 1, -1)
+                if "gdn-conv-rev" in flips:
+                    # ggml_ssm_conv and torch's conv1d disagree on tap order for some
+                    # conversions; a reversed kernel is causal either way and same-magnitude.
+                    conv_w = conv_w.flip(-1)
+                cd = conv_w.shape[0]
+                mixed = F.conv1d(
+                    qkv.T.unsqueeze(0), conv_w, groups=cd, padding=conv_w.shape[-1] - 1
+                )[0, :, :Tn].T
+                mixed = F.silu(mixed)
+                q, k, v = torch.split(mixed, [key_dim, key_dim, val_dim], dim=-1)
+                if "gdn-qk" in flips:
+                    q, k = k, q
+                rep_g = n_v // n_k
+                if "gdn-gqa-tile" in flips:
+                    q = q.reshape(1, Tn, n_k, dk).repeat(1, 1, rep_g, 1)
+                    k = k.reshape(1, Tn, n_k, dk).repeat(1, 1, rep_g, 1)
+                else:
+                    q = q.reshape(1, Tn, n_k, dk).repeat_interleave(rep_g, dim=2)
+                    k = k.reshape(1, Tn, n_k, dk).repeat_interleave(rep_g, dim=2)
+                v = v.reshape(1, Tn, n_v, dv)
+
+                # A_log / dt_bias are exempt from the model-dtype downcast in the engine and
+                # the gating is evaluated in fp32; keep that here or bf16 noise enters the
+                # decay before the recurrence ever runs.
+                A_log = torch.log(-Wf(L, "ssm_a"))
+                dt_bias = Wf(L, "ssm_dt.bias")
+                beta = b_raw.float().sigmoid().reshape(1, Tn, n_v)
+                gg = (-A_log.exp() * F.softplus(a_raw.float() + dt_bias)).reshape(1, Tn, n_v)
+                core, _ = recurrent_gated_delta_rule(q, k, v, gg, beta, use_qk_l2norm=True)
+
+                # Gated RMSNorm in fp32, like the fused rms_norm_gated kernel.
+                core = core[0].reshape(-1, dv).float()
+                zz = z.reshape(-1, dv).float()
+                nw = Wf(L, "ssm_norm.weight")
+                core = core * torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + eps) * nw
+                core = (core * F.silu(zz)).to(dt)
+                mixer = core.reshape(Tn, -1) @ W(L, "ssm_out.weight").T
             else:
-                q, gate = qg[..., :hd], qg[..., hd:]
-            k = (h @ W(L, "attn_k.weight").T).view(Tn, n_kv, hd)
-            v = (h @ W(L, "attn_v.weight").T).view(Tn, n_kv, hd)
-            q = rope(rms_norm(q, W(L, "attn_q_norm.weight"), eps))
-            k = rope(rms_norm(k, W(L, "attn_k_norm.weight"), eps))
-            rep = n_q // n_kv
-            if "attn-gqa-tile" in flips:
-                kk, vv = k.repeat(1, rep, 1), v.repeat(1, rep, 1)
-            else:
-                kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
-            # Scores and softmax accumulate in fp32 (as every attention kernel does), then
-            # the result returns to the working dtype.
-            sc = torch.einsum("qhd,khd->hqk", q.float(), kk.float()) / math.sqrt(hd)
-            sc = sc + torch.full((Tn, Tn), float("-inf")).triu(1)
-            o = torch.einsum("hqk,khd->qhd", sc.softmax(-1), vv.float())
-            o = o.reshape(Tn, n_q * hd).to(dt)
-            mixer = (o * torch.sigmoid(gate.reshape(Tn, n_q * hd))) @ W(L, "attn_output.weight").T
+                qg = (h @ W(L, "attn_q.weight").T).view(Tn, n_q, hd * 2)
+                if "attn-gate" in flips:
+                    gate, q = qg[..., :hd], qg[..., hd:]
+                else:
+                    q, gate = qg[..., :hd], qg[..., hd:]
+                k = (h @ W(L, "attn_k.weight").T).view(Tn, n_kv, hd)
+                v = (h @ W(L, "attn_v.weight").T).view(Tn, n_kv, hd)
+                q = rope(rms_norm(q, W(L, "attn_q_norm.weight"), eps))
+                k = rope(rms_norm(k, W(L, "attn_k_norm.weight"), eps))
+                rep = n_q // n_kv
+                if "attn-gqa-tile" in flips:
+                    kk, vv = k.repeat(1, rep, 1), v.repeat(1, rep, 1)
+                else:
+                    kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+                # Scores and softmax accumulate in fp32 (as every attention kernel does), then
+                # the result returns to the working dtype.
+                sc = torch.einsum("qhd,khd->hqk", q.float(), kk.float()) / math.sqrt(hd)
+                sc = sc + torch.full((Tn, Tn), float("-inf")).triu(1)
+                o = torch.einsum("hqk,khd->qhd", sc.softmax(-1), vv.float())
+                o = o.reshape(Tn, n_q * hd).to(dt)
+                mixer = (o * torch.sigmoid(gate.reshape(Tn, n_q * hd))) @ W(L, "attn_output.weight").T
 
-        residual = residual + mixer
-        resid_after_mixer = residual  # the probe prints the residual at this point
-        h2 = rms_norm(residual, W(L, "post_attention_norm.weight"), eps)
+            residual = residual + mixer
+            resid_after_mixer = residual  # the probe prints the residual at this point
+            h2 = rms_norm(residual, W(L, "post_attention_norm.weight"), eps)
 
-        # MoE: shared expert + routed top-k
-        gs, us, ds = (W(L, f"ffn_{n}_shexp.weight") for n in ("gate", "up", "down"))
-        if "moe-gate-up" in flips:
-            gs, us = us, gs
-        shared = (F.silu(h2 @ gs.T) * (h2 @ us.T)) @ ds.T
-        shared = shared * torch.sigmoid(h2 @ W(L, "ffn_gate_inp_shexp.weight").reshape(1, H).T)
+            # MoE: shared expert + routed top-k
+            gs, us, ds = (W(L, f"ffn_{n}_shexp.weight") for n in ("gate", "up", "down"))
+            if "moe-gate-up" in flips:
+                gs, us = us, gs
+            shared = (F.silu(h2 @ gs.T) * (h2 @ us.T)) @ ds.T
+            shared = shared * torch.sigmoid(h2 @ W(L, "ffn_gate_inp_shexp.weight").reshape(1, H).T)
 
-        # Match fused_topk: logits from the working-dtype linear, softmax in fp32. The
-        # router is the discrete amplifier in this model, so its precision is not a detail.
-        probs = (h2 @ W(L, "ffn_gate_inp.weight").T).float().softmax(-1)
-        tw, tid = probs.topk(cfg.num_experts_per_tok, dim=-1)
-        tw = (tw / tw.sum(-1, keepdim=True)).to(dt)
-        E, I = cfg.num_experts, cfg.moe_intermediate_size
-        ge, ue, de = (T_[f"blk.{L}.ffn_{n}_exps.weight"] for n in ("gate", "up", "down"))
-        if "moe-gate-up" in flips:
-            ge, ue = ue, ge
+            # Match fused_topk: logits from the working-dtype linear, softmax in fp32. The
+            # router is the discrete amplifier in this model, so its precision is not a detail.
+            probs = (h2 @ W(L, "ffn_gate_inp.weight").T).float().softmax(-1)
+            tw, tid = probs.topk(cfg.num_experts_per_tok, dim=-1)
+            tw = (tw / tw.sum(-1, keepdim=True)).to(dt)
+            E, I = cfg.num_experts, cfg.moe_intermediate_size
+            ge, ue, de = (T_[f"blk.{L}.ffn_{n}_exps.weight"] for n in ("gate", "up", "down"))
+            if "moe-gate-up" in flips:
+                ge, ue = ue, ge
 
-        used = sorted(set(tid.reshape(-1).tolist()))
-        gw = {e: deq_rows(ge, e * I, (e + 1) * I, (I, H)).to(dt) for e in used}
-        uw = {e: deq_rows(ue, e * I, (e + 1) * I, (I, H)).to(dt) for e in used}
-        dw = {e: deq_rows(de, e * H, (e + 1) * H, (H, I)).to(dt) for e in used}
-        routed = torch.zeros(Tn, H, dtype=dt)
-        for i in range(Tn):
-            for j in range(cfg.num_experts_per_tok):
-                e = int(tid[i, j])
-                xi = h2[i]
-                routed[i] += float(tw[i, j]) * ((F.silu(xi @ gw[e].T) * (xi @ uw[e].T)) @ dw[e].T)
+            used = sorted(set(tid.reshape(-1).tolist()))
+            gw = {e: deq_rows(ge, e * I, (e + 1) * I, (I, H)).to(dt) for e in used}
+            uw = {e: deq_rows(ue, e * I, (e + 1) * I, (I, H)).to(dt) for e in used}
+            dw = {e: deq_rows(de, e * H, (e + 1) * H, (H, I)).to(dt) for e in used}
+            routed = torch.zeros(Tn, H, dtype=dt)
+            for i in range(Tn):
+                for j in range(cfg.num_experts_per_tok):
+                    e = int(tid[i, j])
+                    xi = h2[i]
+                    routed[i] += float(tw[i, j]) * ((F.silu(xi @ gw[e].T) * (xi @ uw[e].T)) @ dw[e].T)
 
-        mlp_out = routed + shared
-        residual = residual + mlp_out
-        # Same fields, same order, same semantics as FREETOKEN_LAYER_PROBE, so an engine
-        # trace and this one can be diffed line by line to find the first layer where the
-        # two implementations part company.
-        line = (
-            f"[ref] layer {L:>2} {'gdn ' if cfg.is_linear_layer(L) else 'attn'}"
-            f"  norm_in={_r(h):9.4f}  mixer_out={_r(mixer):9.4f}"
-            f"  mlp_in={_r(h2):9.4f}  mlp_out={_r(mlp_out):9.4f}"
-            f"  residual={_r(resid_after_mixer):9.4f}"
-        )
-        if eng is not None:
-            def cos(a, key):
-                b = eng.get(f"L{L}.{key}")
-                return float("nan") if b is None else float(
-                    F.cosine_similarity(a.reshape(1, -1).float(), b.reshape(1, -1).float())
-                )
-            cm, cp, cr = cos(mixer, "mixer"), cos(mlp_out, "mlp_out"), cos(residual, "residual")
-            line += f"  | cos mixer={cm:+.5f} mlp={cp:+.5f} resid={cr:+.5f}"
-            if min(cm, cp, cr) < 0.99:
-                line += "  <<<"
-        print(line, flush=True)
+            mlp_out = routed + shared
+            residual = residual + mlp_out
+            # Same fields, same order, same semantics as FREETOKEN_LAYER_PROBE, so an engine
+            # trace and this one can be diffed line by line to find the first layer where the
+            # two implementations part company.
+            line = (
+                f"[ref] layer {L:>2} {'gdn ' if cfg.is_linear_layer(L) else 'attn'}"
+                f"  norm_in={_r(h):9.4f}  mixer_out={_r(mixer):9.4f}"
+                f"  mlp_in={_r(h2):9.4f}  mlp_out={_r(mlp_out):9.4f}"
+                f"  residual={_r(resid_after_mixer):9.4f}"
+            )
+            if eng is not None:
+                def cos(a, key):
+                    b = eng.get(f"L{L}.{key}")
+                    return float("nan") if b is None else float(
+                        F.cosine_similarity(a.reshape(1, -1).float(), b.reshape(1, -1).float())
+                    )
+                cm, cp, cr = cos(mixer, "mixer"), cos(mlp_out, "mlp_out"), cos(residual, "residual")
+                line += f"  | cos mixer={cm:+.5f} mlp={cp:+.5f} resid={cr:+.5f}"
+                if min(cm, cp, cr) < 0.99:
+                    line += "  <<<"
+        if trace:
+            print(line, flush=True)
 
-    final = rms_norm(residual, deq(T_["output_norm.weight"]), eps)
-    head = T_["output.weight"]
-    xl = final[-1]
-    V, blk = head.shape[0], 16384
-    logits = torch.empty(V)
-    for s in range(0, V, blk):
-        e = min(s + blk, V)
-        logits[s:e] = deq_rows(head, s, e, (e - s, H)) @ xl.float()
+        final = rms_norm(residual, deq(T_['output_norm.weight']), eps)
+        head_t = T_['output.weight']
+        xl = final[-1]
+        V, blk = head_t.shape[0], 16384
+        logits = torch.empty(V)
+        for s in range(0, V, blk):
+            e = min(s + blk, V)
+            logits[s:e] = deq_rows(head_t, s, e, (e - s, H)) @ xl.float()
+        return logits
+
+    toks = load_gguf_metadata(args.gguf)['tokenizer.ggml.tokens']
+    logits = forward_logits(ids, trace=True)
     p = logits.softmax(-1)
-    toks = load_gguf_metadata(args.gguf)["tokenizer.ggml.tokens"]
     top = p.topk(args.topk)
-    print(f"\ntop-{args.topk} next tokens  (flips: {sorted(flips) or 'none'}):")
+    print(f'\ntop-{args.topk} next tokens  (flips: {sorted(flips) or "none"}):')
     for pv, i in zip(top.values.tolist(), top.indices.tolist()):
-        print(f"  {pv*100:6.2f}%  id={i:<7d} {toks[i]!r}")
+        print(f'  {pv*100:6.2f}%  id={i:<7d} {toks[i]!r}')
+
+    if args.generate:
+        # Greedy continuation. One token at a time, recomputing the whole prefill --
+        # slow, but it needs no cache and so cannot inherit a cache bug.
+        cur = ids.clone()
+        out = []
+        for _ in range(args.generate):
+            nxt = int(forward_logits(cur, trace=False).argmax())
+            out.append(nxt)
+            cur = torch.cat([cur, torch.tensor([nxt])])
+        text = ''.join(toks[i] for i in out).replace('\u0120', ' ').replace('\u010a', chr(10))
+        print(f'\ngreedy {args.generate} tokens (flips: {sorted(flips) or "none"}):')
+        print(f'  ids  {out}')
+        print(f'  text {text!r}')
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
