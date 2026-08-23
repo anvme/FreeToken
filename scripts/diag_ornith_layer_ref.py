@@ -104,11 +104,22 @@ def main() -> int:
         t = T_[f"blk.{L}.{suffix}"]
         return deq(t._raw, t.ggml_type, t.shape)
 
-    # ---- embedding (gather only the prompt's rows, then dequantize) -------------
-    emb_t = T_["token_embd.weight"]
-    rows = np.ascontiguousarray(emb_t._raw[ids.numpy()])
-    x = deq(rows, emb_t.ggml_type, (T, H))
-    ok_all = report("embed", d["embed"], x, args.tol)
+    # ---- the layer's input residual stream --------------------------------------
+    # Layer 0 begins at the embedding, so that whole path gets checked. A later layer
+    # begins mid-stream: take its recorded entry state (hidden, residual) and check this
+    # layer in isolation, rather than inheriting every earlier layer's drift.
+    ok_all = True
+    if L == 0:
+        emb_t = T_["token_embd.weight"]
+        rows = np.ascontiguousarray(emb_t._raw[ids.numpy()])
+        x = deq(rows, emb_t.ggml_type, (T, H))
+        ok_all &= report("embed", d["embed"], x, args.tol)
+    else:
+        assert "entry_residual" in d, "dump lacks entry_residual (re-dump with this build)"
+        # The layer fuses the pending residual add into its input norm:
+        # forward_add_residual(hidden, residual) -> (norm(hidden + residual), hidden + residual)
+        x = d["entry_hidden"] + d["entry_residual"]
+        print(f"  entry residual rms={float(x.pow(2).mean().sqrt()):.4f}")
 
     # ---- input_layernorm --------------------------------------------------------
     h = rms_norm(x, w("attn_norm.weight"), eps)

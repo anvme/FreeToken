@@ -111,6 +111,12 @@ class Qwen3_5DecoderLayer(BaseOP):
         probe = _probing()
         # "embed" is only recorded on a real prefill, so it also gates out the warmup pass.
         dump = _dumping() and self._layer_id == _DUMP_LAYER and "embed" in _dump
+        if dump:
+            # Layer L>0 starts from the residual stream, not the embedding, so the
+            # reference needs this layer's actual entry state to check it in isolation.
+            _keep("entry_hidden", hidden)
+            if residual is not None:
+                _keep("entry_residual", residual)
         norm_in = _rms(hidden) if probe else 0.0
         if dump:
             _keep("norm_in", hidden)
