@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,6 +21,28 @@ from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+# FREETOKEN_LAYER_PROBE=N logs the RMS of each sublayer's output for the first N
+# forwards. A correct model keeps the residual stream growing smoothly and every
+# sublayer contributing a comparable share; a mis-mapped weight shows up as one
+# sublayer whose RMS collapses to ~0, explodes, or goes NaN, which localizes a
+# garbage-output bug to a single op without bisecting the checkpoint.
+_PROBE = int(os.environ.get("FREETOKEN_LAYER_PROBE", "0"))
+_probe_forwards = 0
+
+
+def _probing() -> bool:
+    # The probe reads tensors back to host, which is illegal mid-capture, so it stays
+    # off while a CUDA graph is being recorded (prefill, the interesting case, is never
+    # captured anyway).
+    return (
+        _probe_forwards < _PROBE
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _rms(t: torch.Tensor) -> float:
+    return float(t.detach().float().pow(2).mean().sqrt())
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -62,9 +85,21 @@ class Qwen3_5DecoderLayer(BaseOP):
             hidden = self.input_layernorm.forward(hidden)
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
+        probe = _probing()
+        norm_in = _rms(hidden) if probe else 0.0
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        mixer_out = _rms(hidden) if probe else 0.0
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        mlp_in = _rms(hidden) if probe else 0.0
         hidden = self.mlp.forward(hidden)
+        if probe:
+            print(
+                f"[probe] layer {self._layer_id:>2} {'gdn ' if self._is_linear else 'attn'}"
+                f"  norm_in={norm_in:9.4f}  mixer_out={mixer_out:9.4f}"
+                f"  mlp_in={mlp_in:9.4f}  mlp_out={_rms(hidden):9.4f}"
+                f"  residual={_rms(residual):9.4f}",
+                flush=True,
+            )
         return hidden, residual
 
 
@@ -81,10 +116,21 @@ class Qwen3_5Model(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        if _probing():
+            print(
+                f"[probe] forward #{_probe_forwards} tokens={input_ids.shape[0]} "
+                f"ids={input_ids[:16].tolist()} embed_rms={_rms(x):.4f}",
+                flush=True,
+            )
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
+        probe = _probing()
         x, _ = self.norm.forward_add_residual(x, residual)
+        if probe:
+            global _probe_forwards
+            print(f"[probe] final_norm_rms={_rms(x):.4f}", flush=True)
+            _probe_forwards += 1
         return x
 
 
