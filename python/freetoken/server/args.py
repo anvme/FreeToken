@@ -615,7 +615,12 @@ def parse_args(
     run_shell |= kwargs.pop("shell_mode")
     kwargs["shell_mode"] = run_shell
     if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
+        # The shell is single-stream, so bs=1 and a bs=1 decode graph are the right
+        # defaults -- but only defaults. An explicit --cuda-graph-max-bs has to win, since
+        # 0 (no capture) is how you get an eager decode loop: under graph replay the
+        # Python forward never runs, so debug instrumentation sees prefill only.
+        if kwargs.get("cuda_graph_max_bs") is None:
+            kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
