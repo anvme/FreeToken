@@ -63,6 +63,8 @@ def main() -> int:
     ap.add_argument("--flip", default="", help=f"comma-separated: {', '.join(FLIPS)}")
     ap.add_argument("--prompt", default="hi")
     ap.add_argument("--topk", type=int, default=15)
+    ap.add_argument("--engine-dump", default=None,
+                    help="a FREETOKEN_DUMP_LAYER=all .pt; adds per-layer cosine vs the engine")
     args = ap.parse_args()
 
     flips = {f.strip() for f in args.flip.split(",") if f.strip()}
@@ -143,6 +145,18 @@ def main() -> int:
             a, b = r[..., : rd // 2], r[..., rd // 2 :]
             out = torch.cat([a * c - b * s, b * c + a * s], dim=-1)
         return torch.cat([out, keep], dim=-1)
+
+    # Optional engine trace to compare against. Cosine is the point: the RMS traces agree
+    # to ~5% through layer 23 and then break, but equal magnitude does not mean equal
+    # vector, so only the angle says where the two streams actually part.
+    eng = None
+    if args.engine_dump:
+        eng = torch.load(args.engine_dump, map_location="cpu")
+        got = eng["input_ids"].long().tolist()
+        assert got == ids.tolist(), (
+            f"engine dump tokenized differently: {got} vs {ids.tolist()}"
+        )
+        print(f"comparing against engine dump {args.engine_dump}")
 
     t0 = time.time()
     residual = x
@@ -234,13 +248,23 @@ def main() -> int:
         # Same fields, same order, same semantics as FREETOKEN_LAYER_PROBE, so an engine
         # trace and this one can be diffed line by line to find the first layer where the
         # two implementations part company.
-        print(
+        line = (
             f"[ref] layer {L:>2} {'gdn ' if cfg.is_linear_layer(L) else 'attn'}"
             f"  norm_in={_r(h):9.4f}  mixer_out={_r(mixer):9.4f}"
             f"  mlp_in={_r(h2):9.4f}  mlp_out={_r(mlp_out):9.4f}"
-            f"  residual={_r(resid_after_mixer):9.4f}",
-            flush=True,
+            f"  residual={_r(resid_after_mixer):9.4f}"
         )
+        if eng is not None:
+            def cos(a, key):
+                b = eng.get(f"L{L}.{key}")
+                return float("nan") if b is None else float(
+                    F.cosine_similarity(a.reshape(1, -1).float(), b.reshape(1, -1).float())
+                )
+            cm, cp, cr = cos(mixer, "mixer"), cos(mlp_out, "mlp_out"), cos(residual, "residual")
+            line += f"  | cos mixer={cm:+.5f} mlp={cp:+.5f} resid={cr:+.5f}"
+            if min(cm, cp, cr) < 0.99:
+                line += "  <<<"
+        print(line, flush=True)
 
     final = rms_norm(residual, deq(T_["output_norm.weight"]), eps)
     head = T_["output.weight"]

@@ -50,7 +50,12 @@ def _rms(t: torch.Tensor) -> float:
 # the same layer from the GGUF in fp32 and diff sublayer by sublayer. RMS alone cannot
 # catch a bug that computes the wrong thing at the right magnitude; an actual reference
 # can.
-_DUMP_LAYER = int(os.environ.get("FREETOKEN_DUMP_LAYER", "-1"))
+_DUMP_ENV = os.environ.get("FREETOKEN_DUMP_LAYER", "-1")
+# "all" records every layer's mixer/mlp/residual instead of one layer's internals, so the
+# CPU reference can compare *directions* layer by layer. Matching RMS is not matching
+# vectors -- a stream can drift off course while its magnitude tracks perfectly.
+_DUMP_ALL = _DUMP_ENV == "all"
+_DUMP_LAYER = 0 if _DUMP_ALL else int(_DUMP_ENV)
 _DUMP_PATH = os.environ.get("FREETOKEN_DUMP_PATH", "ornith_layer_dump.pt")
 _dump: dict[str, torch.Tensor] = {}
 _dump_done = False
@@ -103,7 +108,8 @@ class Qwen3_5DecoderLayer(BaseOP):
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
         probe = _probing()
         # "embed" is only recorded on a real prefill, so it also gates out the warmup pass.
-        dump = _dumping() and self._layer_id == _DUMP_LAYER and "embed" in _dump
+        every = _dumping() and _DUMP_ALL and "embed" in _dump
+        dump = _dumping() and not _DUMP_ALL and self._layer_id == _DUMP_LAYER and "embed" in _dump
         if dump:
             # Capture BEFORE the input norm: layer L>0 starts mid-residual-stream, and the
             # reference reconstructs its input as hidden + residual -- the same sum
@@ -128,6 +134,8 @@ class Qwen3_5DecoderLayer(BaseOP):
         mixer_out = _rms(hidden) if probe else 0.0
         if dump:
             _keep("mixer_out", hidden)
+        if every:
+            _keep(f"L{self._layer_id}.mixer", hidden)
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
         mlp_in = _rms(hidden) if probe else 0.0
         if dump:
@@ -136,6 +144,9 @@ class Qwen3_5DecoderLayer(BaseOP):
         hidden = self.mlp.forward(hidden)
         if dump:
             _keep("mlp_out", hidden)
+        if every:
+            _keep(f"L{self._layer_id}.mlp_out", hidden)
+            _keep(f"L{self._layer_id}.residual", residual + hidden)
         if probe:
             print(
                 f"[probe] layer {self._layer_id:>2} {'gdn ' if self._is_linear else 'attn'}"
@@ -181,13 +192,13 @@ class Qwen3_5Model(BaseOP):
         if probe:
             print(f"[probe] final_norm_rms={_rms(x):.4f}", flush=True)
             _probe_forwards += 1
-        if dump and "mlp_out" in _dump:
+        if dump and (_DUMP_ALL or "mlp_out" in _dump):
             _keep("final_norm", x)
             torch.save(_dump, _DUMP_PATH)
             _dump_done = True
             print(
-                f"[dump] layer {_DUMP_LAYER} tensors -> {_DUMP_PATH} "
-                f"({', '.join(sorted(_dump))})",
+                f"[dump] {'all layers' if _DUMP_ALL else f'layer {_DUMP_LAYER}'} "
+                f"-> {_DUMP_PATH} ({len(_dump)} tensors)",
                 flush=True,
             )
         return x
