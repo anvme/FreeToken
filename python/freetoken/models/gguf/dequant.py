@@ -1,5 +1,6 @@
 """GGML block-quant dequantization in pure torch (the formats this repo's GGUF
-checkpoints use: Q4_0, Q6_K, plus trivial F32/F16/BF16).
+checkpoints use: Q4_0, Q8_0, the K-quants Q4_K/Q5_K/Q6_K, plus trivial
+F32/F16/BF16).
 
 This is the *reference / CPU* path, NOT the engine's hot path: GGUF weights stay
 packed and are dequantized inside the borrowed ggml CUDA kernels (see
@@ -23,6 +24,8 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +36,8 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 180),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,8 +47,20 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
+
+# expert_quant / moe_weight_format string -> ggml type (the native-quant GGUF formats).
+GGUF_FORMAT_TO_GGML: dict[str, int] = {
+    "q4_0": GGML_Q4_0,
+    "q8_0": GGML_Q8_0,
+    "q4_k": GGML_Q4_K,
+    "q5_k": GGML_Q5_K,
+    "q6_k": GGML_Q6_K,
+}
+GGML_TO_GGUF_FORMAT: dict[int, str] = {v: k for k, v in GGUF_FORMAT_TO_GGML.items()}
 
 
 def row_bytes(numel: int, ggml_type: int) -> int:
@@ -77,6 +94,119 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 codes; ``w = d*q``.
+
+    The block's fp16 scale doubles as the fp16 delta (ggml keeps it as fp16; the
+    int8 codes carry the sign), so the dequant is a single scaled multiply.
+    """
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].view(torch.int8).to(torch.float32)  # [N,32]
+    return (d * q).reshape(-1).to(out_dtype)
+
+
+def _scale_min_k4(j: torch.Tensor, scl: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The 6-bit scale + min pair for sub-block ``j``, unpacked per ggml's
+    ``get_scale_min_k4`` (the 6-bit values are interleaved 4-per-byte with the
+    high 2 bits living in the next group's byte, bits 6..7). ``scl`` is the
+    12-byte (Q4_K) / 16-byte (Q5_K) super-block scale field; ``j`` is a (long)
+    tensor of sub-block ids. Mirrors ``csrc/gguf/dequantize.cuh`` exactly."""
+    lo = (scl.index_select(1, j) & 63)  # first 6 bits of byte j (j < 4 path)
+    hi = (scl.index_select(1, (j + 4).clamp(max=15)) // 16)  # bits 4..7 of byte j+4
+    hi4 = (scl.index_select(1, (j - 4).clamp(min=0)) >> 6) << 4  # bits 6..7 of byte j-4
+    # j < 4: the whole 6-bit value sits in byte j (bits 6..7 of those bytes
+    # carry the high bits of scales 4..7 instead -- they belong to the next group).
+    d = torch.where(j < 4, lo, hi4 | (hi & 0xF))
+    # mins: j < 4 -> byte j+4 low 6 bits; j >= 4 -> byte j+4 bits 4..7
+    # + bits 6..7 of byte j.
+    m_lo = scl.index_select(1, (j + 4).clamp(max=15)) & 63
+    m_hi = (scl.index_select(1, (j + 4).clamp(max=15)) >> 4) | (
+        (scl.index_select(1, j.clamp(min=0)) >> 6) << 4
+    )
+    m = torch.where(j < 4, m_lo, m_hi)
+    return d, m
+
+
+def _k_scale_unpacked(scl: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack all 8 (scale, min) 6-bit pairs of a super-block. ``scl`` is
+    ``[N, 12]`` (Q4_K) or ``[N, 16]`` (Q5_K); returns ``scale [N,8]``, ``min [N,8]``."""
+    j = torch.arange(8, device=scl.device).expand(scl.shape[0], 8)
+    return _scale_min_k4(j, scl)
+
+
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K: 256-elem super-block = fp16 ``dall``/``dmin`` + 12B 6-bit
+    sub-scales/mins (8 each) + 128 packed 4-bit codes.
+
+    The 4-bit codes are plain (not offset): ``w = dall*sc*q - dmin*mn`` per
+    32-elem sub-block. Byte ``l`` of a sub-block's 32 bytes holds element ``l``
+    in its low nibble and element ``l+32`` in its high nibble, matching
+    ``dequantize_block_q4_K`` in ``csrc/gguf``.
+    """
+    raw = raw.reshape(-1, 144)
+    n = raw.shape[0]
+    dall = _f16_scales(raw, 0, 2)  # [n,1]
+    dmin = _f16_scales(raw, 2, 4)  # [n,1]
+    sc, mn = _k_scale_unpacked(raw[:, 4:16])  # [n,8]
+    qs = raw[:, 16:144]  # [n,128]
+    y = torch.empty((n, 256), dtype=torch.float32, device=raw.device)
+    for il in range(4):  # 64-elem segments; sub-blocks 2*il (lo nibble), 2*il+1 (hi nibble)
+        qseg = qs[:, il * 32:(il + 1) * 32]  # [n,32] bytes = 64 codes
+        lo = (qseg & 0x0F).to(torch.float32)  # elements 0..31 of the segment
+        hi = (qseg >> 4).to(torch.float32)  # elements 32..63
+        base = il * 64
+        y[:, base:base + 32] = dall * sc[:, 2 * il:2 * il + 1] * lo - dmin * mn[:, 2 * il:2 * il + 1]
+        y[:, base + 32:base + 64] = (
+            dall * sc[:, 2 * il + 1:2 * il + 2] * hi - dmin * mn[:, 2 * il + 1:2 * il + 2]
+        )
+    return y.reshape(-1).to(out_dtype)
+
+
+def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q5_K: 256-elem super-block = fp16 ``dall``/``dmin`` + 16B scale field
+    (first 12B hold the 8 6-bit scale/min pairs) + 32 high-bit planes + 128
+    packed 4-bit codes. Per 32-elem sub-block: ``w = dall*sc*q - dmin*mn`` with
+    ``q = 4-bit code + 16 * high-bit``.
+
+    Byte ``j`` of a segment's 32 code bytes holds two 4-bit codes (low nibble =
+    sub-block ``2*il`` element ``j``, high nibble = sub-block ``2*il+1`` element
+    ``j``). Element ``j``'s high bit lives in high plane byte ``j``, at bit
+    ``2*il`` (sub-block A) / ``2*il+1`` (sub-block B). Matches
+    ``dequantize_block_q5_K`` in ``csrc/gguf``.
+    """
+    raw = raw.reshape(-1, 180)
+    n = raw.shape[0]
+    dall = _f16_scales(raw, 0, 2)  # [n,1]
+    dmin = _f16_scales(raw, 2, 4)  # [n,1]
+    sc, mn = _k_scale_unpacked(raw[:, 4:20])  # [n,8] (field is 16B; first 12B are used)
+    qh = raw[:, 20:52]  # [n,32] high-bit planes
+    qs = raw[:, 52:180]  # [n,128]
+    y = torch.empty((n, 256), dtype=torch.float32, device=raw.device)
+    for il in range(4):
+        qseg = qs[:, il * 32:(il + 1) * 32]  # [n,32] code bytes of the segment
+        # Code byte 2j: lo nibble -> sub-block A elem 2j, hi nibble -> sub-block B elem 2j
+        # (the same byte parity pattern holds for code byte 2j+1).
+        a_even = (qseg[:, 0::2] & 0x0F).to(torch.float32)  # A elem 2j
+        a_odd = (qseg[:, 1::2] & 0x0F).to(torch.float32)  # A elem 2j+1
+        b_even = (qseg[:, 0::2] >> 4).to(torch.float32)  # B elem 2j
+        b_odd = (qseg[:, 1::2] >> 4).to(torch.float32)  # B elem 2j+1
+        be = ((qh[:, 0::2] >> (2 * il)) & 1).to(torch.float32)
+        bo = ((qh[:, 1::2] >> (2 * il)) & 1).to(torch.float32)
+        bb = ((qh[:, 0::2] >> (2 * il + 1)) & 1).to(torch.float32)
+        bd = ((qh[:, 1::2] >> (2 * il + 1)) & 1).to(torch.float32)
+        qa = torch.stack(
+            [a_even + 16.0 * be, a_odd + 16.0 * bo], dim=2
+        ).view(n, 32)  # sub-block A (elements 0..31 of the segment)
+        qb = torch.stack([b_even + 16.0 * bb, b_odd + 16.0 * bd], dim=2).view(n, 32)
+        base = il * 64
+        y[:, base:base + 32] = dall * sc[:, 2 * il:2 * il + 1] * qa - dmin * mn[:, 2 * il:2 * il + 1]
+        y[:, base + 32:base + 64] = (
+            dall * sc[:, 2 * il + 1:2 * il + 2] * qb - dmin * mn[:, 2 * il + 1:2 * il + 2]
+        )
+    return y.reshape(-1).to(out_dtype)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -117,6 +247,9 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_Q4_K: dequant_q4_k,
+    GGML_Q5_K: dequant_q5_k,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -143,11 +276,18 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
+    "GGUF_FORMAT_TO_GGML",
+    "GGML_TO_GGUF_FORMAT",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
+    "dequant_q4_k",
+    "dequant_q5_k",
     "dequant_q6_k",
     "dequantize",
 ]

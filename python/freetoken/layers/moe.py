@@ -522,14 +522,14 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, gate_up_scale, down, down_scale,
                 topk_weights, topk_ids, self.activation, self.apply_router_weight_on_input,
             )
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
+        if fmt in ("q4_0", "q8_0", "q4_k", "q5_k", "q6_k"):
+            # Native GGUF quant experts: dequant-in-kernel grouped GEMV (MMVQ) over the
             # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+            from freetoken.moe.fused_gguf_q import fused_experts_gguf
 
             gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation, fmt
             )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV

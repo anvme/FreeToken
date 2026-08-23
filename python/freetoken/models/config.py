@@ -288,6 +288,11 @@ class ModelConfig:
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
     # code; None for every other model.
     m3_args: Any | None = None
+    # GGUF adapter payload (qwen35moe): slot name -> ggml quant type each fused projection
+    # group carries natively in the checkpoint (see qwen3_5_moe.gguf). A None value means
+    # the group dequantizes to dense bf16 at load (mixed/non-quant parts). Opaque to
+    # model-agnostic engine code; None for non-GGUF models.
+    gguf_types: dict[str, int | None] | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

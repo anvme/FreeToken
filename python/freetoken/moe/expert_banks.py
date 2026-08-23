@@ -252,6 +252,33 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _gguf_quant_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    # Native GGUF quant experts (Q8_0 / Q4_K / Q5_K / Q6_K): packed block bytes streamed to
+    # the GPU and dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy).
+    # Same single-file caveat as q4_0: parallel readers don't apply to a packed GGUF.
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for GGUF quants: GGUF is a single packed file "
+            "(not safetensors), so the common reader doesn't apply"
+        )
+    from freetoken.models.gguf.dequant import GGUF_FORMAT_TO_GGML
+    from freetoken.models.weight import load_gguf_moe_expert_sources
+
+    expert_quant = model_config.expert_quant
+    quant = GGUF_FORMAT_TO_GGML.get(expert_quant)
+    assert quant is not None, f"no ggml type for expert_quant={expert_quant!r}"
+    # Per-layer HostBanks (pin-after-fill); conversion streams each completed layer's
+    # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
+    sink = None if dummy else layer_sink
+    sources = load_gguf_moe_expert_sources(
+        model_path, model_config, quant=quant, dummy=dummy, layer_sink=sink
+    )
+    return ExpertBanks(
+        expert_quant, {name: sources[name] for name in _BANK_SCHEMAS[expert_quant]},
+        streamed=sink is not None
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -301,6 +328,12 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    # native GGUF quants (quant-generic provider; the expert's ggml type comes from
+    # model_config.expert_quant, set by the GGUF adapter from the file's tensor types)
+    "q8_0": _gguf_quant_banks,
+    "q4_k": _gguf_quant_banks,
+    "q5_k": _gguf_quant_banks,
+    "q6_k": _gguf_quant_banks,
 }
 
 

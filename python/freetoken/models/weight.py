@@ -342,6 +342,35 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_gguf_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    quant: int,
+    dummy: bool = False,
+    layer_sink=None,
+) -> dict:
+    """Load (or fabricate, with ``dummy=True``) packed GGUF expert source banks for a native
+    GGUF quant type (``quant``: ggml type enum, e.g. 8 = Q8_0).
+
+    Mirrors :func:`load_q4_0_moe_expert_sources` but quant-generic: the model module provides
+    ``load_gguf_expert_sources(model_path, config, quant=, layer_sink=)`` /
+    ``dummy_gguf_expert_sources(config, quant)``. ``layer_sink`` (converter) streams each
+    completed layer's banks; ignored for dummy."""
+    from freetoken.models.gguf.dequant import GGML_TO_GGUF_FORMAT
+
+    fmt = GGML_TO_GGUF_FORMAT.get(quant)
+    if fmt is None:
+        raise ValueError(f"no GGUF expert-bank support for ggml type {quant!r}")
+    _config, spec = _spec_for_model_path(model_path)
+    if dummy:
+        builder = _model_override(spec, "dummy_gguf_expert_sources")
+        assert builder is not None, "model defines no dummy_gguf_expert_sources"
+        return builder(model_config, quant)
+    loader = _load_attr(spec.module, "load_gguf_expert_sources")
+    return loader(model_path, model_config, quant=quant, layer_sink=layer_sink)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:

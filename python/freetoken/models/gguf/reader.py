@@ -175,6 +175,23 @@ def gguf_tensor_names(model_path: str) -> set[str]:
     return {t.name for t in _reader(model_path).tensors}
 
 
+@functools.cache
+def gguf_tensor_geom(model_path: str) -> dict[str, tuple[tuple[int, ...], int]]:
+    """Tensor table WITHOUT any data reads: ``{name: (torch_shape, ggml_type)}``.
+
+    ``iter_gguf_tensors`` copies every tensor's packed bytes (necessary when
+    actually loading); this reads only the name/shape/type table, which sits at the
+    file head -- config derivation, quant-type routing and shape validation don't
+    need the multi-GB payload. torch order (ggml dims reversed), same as
+    :class:`GgufTensor.shape`.
+    """
+    reader = _reader(model_path)
+    return {
+        t.name: (tuple(int(s) for s in reversed(t.shape)), int(t.tensor_type))
+        for t in reader.tensors
+    }
+
+
 __all__ = [
     "is_gguf_path",
     "FTW_METADATA_GGUF",
@@ -186,4 +203,5 @@ __all__ = [
     "gguf_architecture",
     "iter_gguf_tensors",
     "gguf_tensor_names",
+    "gguf_tensor_geom",
 ]

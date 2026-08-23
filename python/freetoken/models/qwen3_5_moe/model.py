@@ -108,6 +108,13 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+        from .gguf import convert_qwen35moe_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            # GGUF checkpoint: swap the quantized projections/embedding for native ggml
+            # ops (must run after super().__init__ so state-dict collection sees the
+            # swapped modules, cf. the gemma4 hook).
+            convert_qwen35moe_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
