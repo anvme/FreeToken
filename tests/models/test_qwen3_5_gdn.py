@@ -123,15 +123,72 @@ def test_prefill_gqa_convention():
     )
 
 
+def _orientations(state: torch.Tensor, ref_state: torch.Tensor) -> dict[str, float]:
+    """The recurrent state is square (head_k_dim == head_v_dim == 128), so [K,V] and
+    [V,K] are shape-compatible and only the values tell them apart. Score both."""
+    s, r = state.float(), ref_state.float()
+    return {"[K,V] as-is": _rel(s, r), "[V,K] transposed": _rel(s.transpose(-1, -2), r)}
+
+
 def test_prefill_final_state_matches_reference():
     """The state written back to ``state_source`` seeds every later decode step, so a
-    correct output with a wrong final state still corrupts generation."""
+    correct output with a wrong final state still corrupts generation.
+
+    Reports which orientation the fla kernel writes: the reference builds the state as
+    ``state[k, v] += k_t[k] * delta[v]``, i.e. [K,V].
+    """
     q, k, v, g, beta = _rand_inputs(96, seed=7)
     _, state = _kernel_prefill(q, k, v, g, beta)
     _, ref_state = _reference(q, k, v, g, beta)
-    err = _rel(state[0].float(), ref_state[0].float())
-    print(f"\n  prefill final state max_rel_err={err:.4e}")
-    assert err < TOL, f"fla prefill final state diverges: {err:.3e}"
+    errs = _orientations(state[0], ref_state[0])
+    best = min(errs, key=errs.get)
+    print("\n  prefill final state vs HF reference:")
+    for how, err in errs.items():
+        print(f"    {how:<18s} max_rel_err={err:.4e}{'   <-- fla writes this' if how == best else ''}")
+    assert errs[best] < TOL, (
+        f"fla prefill final state diverges in BOTH orientations "
+        f"({errs['[K,V] as-is']:.3e} / {errs['[V,K] transposed']:.3e}): not a layout "
+        "convention difference, the recurrence itself is wrong"
+    )
+
+
+def test_track_snapshot_orientation():
+    """``gdn._write_track_snapshot`` copies the chunk kernel's per-chunk ``h`` straight
+    into a pool slot, justified by "h is [V,K], the state pool is [K,V]; they coincide
+    because GDN requires head_k_dim == head_v_dim".
+
+    Equal head dims make the two shapes compatible, so the copy never errors -- but it
+    only preserves the *values* if h and the kernel's own written-back state share an
+    orientation. Check that directly: h[0, 1] is the state after the first 64-token
+    chunk, which is exactly what a 64-token prefill leaves in state_source.
+    """
+    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
+
+    dev = torch.device("cuda")
+    q, k, v, g, beta = _rand_inputs(128, seed=13)
+    state_source = torch.zeros(1, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, device=dev, dtype=torch.float32)
+    _, h = gdn_prefill_chunk_fla(
+        q, k, v, g, beta,
+        state_source=state_source,
+        indices=torch.tensor([0], device=dev, dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 128], device=dev, dtype=torch.int64),
+        scale=SCALE, return_h=True,
+    )
+    # Independent ground truth for "state after 64 tokens": prefill just those tokens.
+    _, after64 = _kernel_prefill(q[:, :64], k[:, :64], v[:, :64], g[:, :64], beta[:, :64])
+
+    snapshot = h[0, 1]  # chunk granularity 64 -> h[0,1] == state after tokens 0..63
+    errs = _orientations(snapshot, after64[0])
+    best = min(errs, key=errs.get)
+    print("\n  per-chunk h vs the kernel's own written-back state:")
+    for how, err in errs.items():
+        print(f"    {how:<18s} max_rel_err={err:.4e}{'   <-- h is stored this way' if how == best else ''}")
+    assert errs["[K,V] as-is"] < TOL, (
+        "h and state_source have OPPOSITE orientations, so _write_track_snapshot's direct "
+        "index_copy_ stores every hybrid-radix snapshot transposed "
+        f"(as-is {errs['[K,V] as-is']:.3e} vs transposed {errs['[V,K] transposed']:.3e}); "
+        "it needs h[...].transpose(-1, -2)"
+    )
 
 
 def test_decode_matches_reference():
@@ -162,7 +219,20 @@ def test_decode_matches_reference():
     # The kernel folds the gating in; the reference takes g/beta directly.
     g = (-A_log.exp() * torch.nn.functional.softplus(a + dt_bias)).reshape(1, 1, NUM_V_HEADS)
     beta = b.sigmoid().reshape(1, 1, NUM_V_HEADS)
-    ref, _ = _reference(q, k, v, g, beta, initial_state=prior)
-    err = _rel(got, ref)
-    print(f"\n  decode max_rel_err={err:.4e}")
-    assert err < TOL, f"fla decode diverges from the HF reference: {err:.3e}"
+    # The prior state is not symmetric, so feed the reference each orientation and see
+    # which one the kernel agrees with (same [K,V]/[V,K] question as the prefill state).
+    errs = {
+        "[K,V] as-is": _rel(got, _reference(q, k, v, g, beta, initial_state=prior)[0]),
+        "[V,K] transposed": _rel(
+            got, _reference(q, k, v, g, beta, initial_state=prior.transpose(-1, -2).contiguous())[0]
+        ),
+    }
+    best = min(errs, key=errs.get)
+    print("\n  decode vs HF reference:")
+    for how, err in errs.items():
+        print(f"    {how:<18s} max_rel_err={err:.4e}{'   <-- fla reads this' if how == best else ''}")
+    assert errs[best] < TOL, (
+        f"fla decode diverges in BOTH orientations "
+        f"({errs['[K,V] as-is']:.3e} / {errs['[V,K] transposed']:.3e}): not a layout "
+        "convention difference, the decode recurrence itself is wrong"
+    )
