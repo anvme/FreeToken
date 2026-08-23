@@ -15,6 +15,28 @@ from .reader import gguf_architecture, load_gguf_metadata
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 _TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
 
+# Arch names newer than the installed transformers (whose GGUF_TO_FAST_CONVERTERS
+# predates them) -> converter keys whose construction is compatible (GPT2 vocab +
+# pre-tokenizer/normalizer read from the GGUF metadata), tried in order. freetoken
+# re-sets bos/eos/unk/pad from tokenizer.ggml.* below, so the Qwen-family converters
+# are interchangeable for serving.
+_CONVERTER_FALLBACKS: dict[str, list[str]] = {
+    "qwen35moe": ["qwen35moe", "qwen3moe", "qwen3", "qwen2"],
+}
+
+
+def _converter_key(arch: str) -> str:
+    from transformers.integrations.ggml import GGUF_TO_FAST_CONVERTERS
+
+    chain = _CONVERTER_FALLBACKS.get(arch, [arch])
+    for key in chain:
+        if key in GGUF_TO_FAST_CONVERTERS:
+            return key
+    raise ValueError(
+        f"no GGUF tokenizer converter in the installed transformers for {arch!r} "
+        f"(tried {chain}; available: {sorted(GGUF_TO_FAST_CONVERTERS)})"
+    )
+
 
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
@@ -28,7 +50,7 @@ def load_gguf_tokenizer(model_path: str):
         for k, v in meta.items()
         if k.startswith("tokenizer.ggml.")
     }
-    fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
+    fast, _extra = convert_gguf_tokenizer(_converter_key(conv_arch), tok_dict)
 
     tokens = tok_dict["tokens"]
 
