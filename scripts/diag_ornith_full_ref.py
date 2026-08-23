@@ -53,6 +53,10 @@ def rms_norm(x, w, eps):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
 
 
+def _r(t: torch.Tensor) -> float:
+    return float(t.detach().float().pow(2).mean().sqrt())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("gguf")
@@ -196,6 +200,7 @@ def main() -> int:
             mixer = (o * torch.sigmoid(gate.reshape(Tn, n_q * hd))) @ W(L, "attn_output.weight").T
 
         residual = residual + mixer
+        resid_after_mixer = residual  # the probe prints the residual at this point
         h2 = rms_norm(residual, W(L, "post_attention_norm.weight"), eps)
 
         # MoE: shared expert + routed top-k
@@ -224,10 +229,18 @@ def main() -> int:
                 xi = h2[i]
                 routed[i] += float(tw[i, j]) * ((F.silu(xi @ gw[e].T) * (xi @ uw[e].T)) @ dw[e].T)
 
-        residual = residual + routed + shared
-        if L % 8 == 0 or L == cfg.num_layers - 1:
-            print(f"  layer {L:>2}/{cfg.num_layers - 1}  residual_rms={float(residual.pow(2).mean().sqrt()):.4f}"
-                  f"  ({time.time() - t0:.0f}s)")
+        mlp_out = routed + shared
+        residual = residual + mlp_out
+        # Same fields, same order, same semantics as FREETOKEN_LAYER_PROBE, so an engine
+        # trace and this one can be diffed line by line to find the first layer where the
+        # two implementations part company.
+        print(
+            f"[ref] layer {L:>2} {'gdn ' if cfg.is_linear_layer(L) else 'attn'}"
+            f"  norm_in={_r(h):9.4f}  mixer_out={_r(mixer):9.4f}"
+            f"  mlp_in={_r(h2):9.4f}  mlp_out={_r(mlp_out):9.4f}"
+            f"  residual={_r(resid_after_mixer):9.4f}",
+            flush=True,
+        )
 
     final = rms_norm(residual, deq(T_["output_norm.weight"]), eps)
     head = T_["output.weight"]
