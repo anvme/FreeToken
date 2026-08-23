@@ -76,6 +76,8 @@ def main() -> int:
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--dump", default="ornith_layer_dump.pt")
     ap.add_argument("--tol", type=float, default=5e-2)
+    ap.add_argument("--no-lm-head", action="store_true",
+                    help="skip decoding the final hidden state (dequantizes output.weight)")
     args = ap.parse_args()
 
     from freetoken.models.gguf.reader import iter_gguf_tensors
@@ -216,6 +218,36 @@ def main() -> int:
             xi = h2[i]
             routed[i] += float(tw[i, j]) * ((F.silu(xi @ gw[e].T) * (xi @ uw[e].T)) @ dw[e].T)
     ok_all &= report("mlp_out", d["mlp_out"], routed + shared, args.tol)
+
+    # ---- what the engine's own final hidden state actually predicts ---------------
+    # Every layer checked so far is correct *given its input*. This asks the other
+    # question: after all 40 layers, does the trunk's output decode to plausible next
+    # tokens? Sensible tokens here would put the fault after the trunk (sampling,
+    # detokenization); garbage would mean the stack is wrong end-to-end even though each
+    # layer is locally right.
+    if not args.no_lm_head and "final_norm" in d:
+        from freetoken.models.gguf.reader import load_gguf_metadata
+
+        print("\n  top-15 next-token predictions from the engine's final hidden state:")
+        head = None
+        for t in iter_gguf_tensors(args.gguf):
+            if t.name == "output.weight":
+                head = t
+                break
+        assert head is not None, "no output.weight in the GGUF"
+        toks = load_gguf_metadata(args.gguf)["tokenizer.ggml.tokens"]
+        x_last = d["final_norm"][-1]  # prefill scores the last prompt position
+        # 248320 x 2048 fp32 is ~2 GB; walk it in row blocks instead.
+        V, blk = head.shape[0], 16384
+        logits = torch.empty(V)
+        for s in range(0, V, blk):
+            e = min(s + blk, V)
+            wb = deq(np.ascontiguousarray(head._raw[s:e]), head.ggml_type, (e - s, H))
+            logits[s:e] = wb @ x_last
+        probs = logits.softmax(-1)
+        top = probs.topk(15)
+        for p, i in zip(top.values.tolist(), top.indices.tolist()):
+            print(f"    {p*100:6.2f}%  id={i:<7d} {toks[i]!r}")
 
     print()
     print("all stages match the fp32 reference" if ok_all else
